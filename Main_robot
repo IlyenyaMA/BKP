@@ -1,0 +1,473 @@
+// Код управления логикой и движением робота для сортировки
+#include <bur/plctypes.h>
+#ifdef _DEFAULT_INCLUDES
+#include <AsDefault.h>
+#endif
+ 
+void _INIT ProgramInit(void)
+{
+    
+    delta.MpLink = &g3AxDeltaA;
+    delta.Enable = 1;
+    delta.Parameters = &deltaParameters;
+    delta.Override = 100.0; // %
+    deltaParameters.CoordSystem = mcMCS; // machine (global) coord.system
+    deltaState = stInit;
+    
+    gHome1 = 0; gHome2 = 0; gHome3 = 0; // Limit switches for homing
+    
+    // init camera and matching function
+    gVisionCtrl.Parameters.ExposureTime = 25000;
+    gVisionCtrl.Parameters.SetFocus = 64075;
+    gVisionCtrl.Parameters.NumSearchMax = 1;
+    gVisionCtrl.Parameters.MinScore = 70; //75; // min % of match
+    gVisionCtrl.Cmd.Enable = 1;
+    gVisionCtrl.Parameters.FlashColor=3;
+    gVisionCtrl.Parameters.FlashSegment=0;
+    gVisionCtrl.Parameters.MaxOverlap = 60;
+    gVisionCtrl.Cmd.ImageAcquisition = 0;
+    
+    
+    gActivateGripper = 0;
+ 
+    pwm4_Grip = 0;
+        
+    gBarrier1 = 0;
+    gBarrier2 = 0;
+    gEncCounter = 0;
+    
+    deltaParameters.Velocity = 1000;
+    deltaParameters.Acceleration = 3500;
+    deltaParameters.Deceleration = 3500;
+    
+    z_high = 405;
+    z_table = 427;
+    z_take = 425;
+    y_put = -100;
+    
+    y_take = 0;
+    x_take = 0;
+    
+    
+    shift_x = 21577; //37524; //36305; //41352; //109000; //105000; // from 20201222
+    k_x = 0.004;
+    shift_y = 16070; //15503; //13147; //16392; //14700;//15700;
+    k_y = 0.004;
+    
+    ring1_stay = 0;
+    ring2_stay = 0;
+    ring2_table = 0;
+    ring3_table = 0;
+    delay = 0;
+    SetPos=0;
+ 
+}
+ 
+void MoveAndWait(void)
+    // move to target coordinates, wait end move
+    // before calling this function we should set new target position
+{
+    if(!delta.MoveDirect)
+    {    
+        flag_movedone = 0;
+        delta.MoveDirect = 1;
+    }
+    else if(delta.MoveDone)
+    {        
+        delta.MoveDirect = 0;
+        delta.MoveDone = 0;
+        flag_movedone = 1;
+    }
+}
+ 
+void _CYCLIC ProgramCyclic(void)
+{
+    // from any state we can fall into error
+    if(delta.Error)
+        deltaState = stError;
+    
+    
+    switch (deltaState)
+    {        
+        case stInit:
+            // system is ready for powering on
+            if(delta.Info.ReadyToPowerOn && delta.Active)
+                deltaState = stPower;
+            break;
+ 
+        case stPower:
+            // turning power on
+            if(!delta.PowerOn)
+                delta.Power = 1;
+            else if(delta.PowerOn)
+                deltaState = stHoming;
+            break;
+        
+        case stHoming:
+            // homing
+            if(!delta.IsHomed)
+                delta.Home = 1;
+            else if(delta.IsHomed)
+            {
+                delta.Home = 0;
+                if (gBarrier2)
+                    deltaState = stConvF;
+            }
+            break;
+    
+ 
+        case stConvF:
+            outPosX = 0; outPosY = 0; outModelNumber = 0; ModelNumber = 0;
+            deltaParameters.Position[0] = 0;
+            deltaParameters.Position[1] = 0;
+            deltaParameters.Position[2] = 358;
+            MoveAndWait();
+            if(flag_movedone)
+            {
+                gConvSpeed = 150;
+                gConvEnableF=1;
+                if(gBarrier1)
+                {
+                    gConvEnableF=0;
+                    deltaState = stCapturingF;
+                }
+            }
+            break;
+        
+        case stCapturingF:            
+            // capture images and get coordinates
+            gVisionCtrl.Cmd.ImageAcquisition = 1; // grab image
+        
+            delay++;
+            if(delay > 10) // delay *100 ms for image processing
+            {
+                gVisionCtrl.Cmd.ImageAcquisition = 0;
+                if(outModelNumber != 0) // if object found
+                    // recalculating coordinates from camera to robot
+                {                    
+                    x_take = (LREAL)(outPosX - shift_x) * k_x;
+                    y_take = (LREAL)(outPosY - shift_y) * k_y;
+                    deltaState = stGoToGoal;
+                }
+                else // not found
+                {
+                    SetPos = 90;
+                    deltaState = stConvF;
+                }
+                delay=0;
+            }
+            break;
+        
+        case stGoToGoal:
+            // зависаем над объектом
+            deltaParameters.Position[0] = x_take;
+            deltaParameters.Position[1] = y_take;
+            deltaParameters.Position[2] = z_take;
+            MoveAndWait();
+            if(flag_movedone)
+                deltaState = stRising;
+            break;
+        
+        case stRising:
+            gActivateGripper = 1;
+            // поднимаем кольцо
+            deltaParameters.Position[0] = x_take;
+            deltaParameters.Position[1] = y_take;
+            deltaParameters.Position[2] = z_high;
+            MoveAndWait();
+            if(flag_movedone)
+            {
+                if (outModelNumber == 1)
+                    deltaState = stMoveRing_1;
+                else if (outModelNumber == 2)
+                    deltaState = stMoveRing_2;
+                else if (outModelNumber == 3)
+                    deltaState = stMoveRing_3;
+            }
+            break;
+        
+        case stMoveRing_1:            
+            // передвигаем кольцо 1 вдоль конвейера
+            deltaParameters.Position[0] = x_take;
+            deltaParameters.Position[1] = -25;
+            deltaParameters.Position[2] = z_high;
+            MoveAndWait();
+            if(flag_movedone)
+            {
+                ModelNumber = 1;
+                deltaState = stPutRing_High;
+            }
+            break;
+            
+        case stPutRing_High: 
+            //зависаем над целевой позицией
+            deltaParameters.Position[0] = 95;
+            deltaParameters.Position[1] = -25;
+            deltaParameters.Position[2] = z_high - 5;
+            MoveAndWait();
+            if (flag_movedone)
+            {
+                if (ModelNumber == 1)
+                    deltaState = stPutRing_1;
+                else if (ModelNumber == 2)
+                    deltaState = stPutRing_2;
+                else if (ModelNumber == 3)
+                    deltaState = stPutRing_3;
+            }
+            break;
+        
+        case stPutRing_1: 
+            // постановка кольца 1 на целевую позицию
+            deltaParameters.Position[0] = 95;
+            deltaParameters.Position[1] = -25;
+            deltaParameters.Position[2] = 470;
+            MoveAndWait();
+            if(flag_movedone)
+            {
+                gActivateGripper = 0;
+                ring1_stay = 1;
+                if (ring2_table == 1)
+                    deltaState = stCheckRing_2;
+                else
+                    deltaState = stConvF;
+            }
+            break;
+        
+        case stCheckRing_2:
+            deltaParameters.Position[0] = 95;
+            deltaParameters.Position[1] = -25;
+            deltaParameters.Position[2] = z_high;
+            MoveAndWait();
+            if (flag_movedone)
+            {
+                deltaState = stCheck2Ring_2;
+            }
+            break;
+         
+        case stCheck2Ring_2:
+            deltaParameters.Position[0] = -95; // x2 над столом
+            deltaParameters.Position[1] = -38;  //y2 над столом
+            deltaParameters.Position[2] = z_high; // z2 над столом
+            MoveAndWait();
+            if (flag_movedone)
+            {
+                deltaState = stCheck3Ring_2;
+            }
+            break;
+        
+        case stCheck3Ring_2:
+            deltaParameters.Position[0] = -95; // x2 над столом
+            deltaParameters.Position[1] = -38;  //y2 над столом
+            deltaParameters.Position[2] = 426; // z2 над столом
+            MoveAndWait();
+            if (flag_movedone)
+            {
+                gActivateGripper = 1;
+                deltaState = stCheck2Ring_2High;
+            }
+            break;
+        
+        case stCheck2Ring_2High:
+            deltaParameters.Position[0] = -95; // x2 над столом
+            deltaParameters.Position[1] = -38;  //y2 над столом
+            deltaParameters.Position[2] = z_high; // z2 над столом
+            MoveAndWait();
+            if (flag_movedone)
+            {
+                ModelNumber += 1;
+                deltaState = stPutRing_High;
+            }
+            break;
+        
+        //работаем с кольцом 2
+        case stMoveRing_2:            
+            // take ring 2
+            if (ring1_stay == 1)
+            {
+                deltaParameters.Position[0] = x_take;
+                deltaParameters.Position[1] = -25;
+                deltaParameters.Position[2] = z_high;
+                MoveAndWait();
+                if(flag_movedone)
+                {
+                    ModelNumber = 2;
+                    deltaState = stPutRing_High;
+                }
+            }
+            else
+            {
+                deltaParameters.Position[0] = x_take;
+                deltaParameters.Position[1] = -38;
+                deltaParameters.Position[2] = z_high;
+                MoveAndWait();
+                if(flag_movedone)
+                    deltaState = stTableRing_2;
+            }
+            break;
+        
+        case stPutRing_2:     
+            //кладём 2 кольцо на место
+            deltaParameters.Position[0] = 95;
+            deltaParameters.Position[1] = -25;
+            deltaParameters.Position[2] = 439;
+            MoveAndWait();
+            if (flag_movedone)
+            {
+                gActivateGripper = 0;
+                ring2_stay = 1;
+                if (ring3_table == 1)
+                    deltaState = stCheckRing_3;
+                else 
+                    deltaState = stConvF;
+            }
+            break;
+        
+        case stCheckRing_3: 
+            deltaParameters.Position[0] = 95;
+            deltaParameters.Position[1] = -25;
+            deltaParameters.Position[2] = z_high;
+            MoveAndWait();
+            if (flag_movedone)
+            {
+                deltaState = stCheck2Ring_3;
+            }
+            break;
+        
+        case stCheck2Ring_3: 
+            deltaParameters.Position[0] = -95; // x3 над столом
+            deltaParameters.Position[1] = 37;
+            deltaParameters.Position[2] = z_high; // z3 над столом
+            MoveAndWait();
+            if (flag_movedone)
+            {
+                deltaState = stCheck3Ring_3;
+            }
+            break;
+        
+        case stCheck3Ring_3: 
+            // подъём третьего кольца со стола
+            deltaParameters.Position[0] = -95; // x3 над столом
+            deltaParameters.Position[1] = 37;
+            deltaParameters.Position[2] = 426; // z3 над столом
+            MoveAndWait();
+            if (flag_movedone)
+            {
+                gActivateGripper = 1;
+                deltaState = stCheck2Ring_3High;
+            }
+            break;
+        
+        case stCheck2Ring_3High:
+            deltaParameters.Position[0] = -95; // x2 над столом
+            deltaParameters.Position[1] = 37;  //y2 над столом
+            deltaParameters.Position[2] = z_high; // z2 над столом
+            MoveAndWait();
+            if (flag_movedone)
+            {
+                ModelNumber += 1;
+                deltaState = stPutRing_High;
+            }
+            break;
+ 
+        case stTableRing_2: //ставим кольцо 2 на стол
+            deltaParameters.Position[0] = -95; // x2 над столом
+            deltaParameters.Position[1] = -38;  // y2 над столом
+            deltaParameters.Position[2] = 426; // z2 над столом
+            MoveAndWait();
+            if (flag_movedone)
+            {
+                gActivateGripper = 0;
+                ring2_table = 1;
+                deltaState = stConvF;
+            }
+            break;
+ 
+        
+        //работаем с 3 кольцом
+        case stMoveRing_3:
+            if (ring2_stay == 1)
+            {
+                deltaParameters.Position[0] = x_take;
+                deltaParameters.Position[1] = -25;
+                deltaParameters.Position[2] = z_high;
+                MoveAndWait();
+                if(flag_movedone)
+                {
+                    ModelNumber = 3;
+                    deltaState = stPutRing_High;
+                }
+            }
+            else
+            {
+                deltaParameters.Position[0] = x_take;
+                deltaParameters.Position[1] = 37;
+                deltaParameters.Position[2] = z_high;
+                MoveAndWait();
+                if(flag_movedone)
+                    deltaState = stTableRing_3;
+            }
+            break;
+        
+        case stTableRing_3: //ставим кольцо 3 на стол
+            deltaParameters.Position[0] = -95; // x3 над столом
+            deltaParameters.Position[1] = 37;  // y3 над столом
+            deltaParameters.Position[2] = 426; // z3 над столом
+            MoveAndWait();
+            if (flag_movedone)
+            {
+                gActivateGripper = 0;
+                ring3_table = 1;
+                deltaState = stConvF;
+            }
+            break;
+ 
+        case stPutRing_3: //ставим кольцо 3 в целевое положение
+            deltaParameters.Position[0] = 95;
+            deltaParameters.Position[1] = -25;
+            deltaParameters.Position[2] = 410;
+            MoveAndWait();
+            if(flag_movedone)
+            {
+                gActivateGripper = 0;
+                ring1_stay = 0; ring2_stay = 0; ring2_table = 0; ring3_table = 0;
+                deltaState = stConvF;
+            }
+            break;        
+        
+        case stError:
+            // error stop
+            delta.Home = 0;
+            delta.MoveDirect = 0;
+            delta.MoveProgram = 0;
+            delta.Power = 0;
+            // if error is reset, go back to startup
+            if (!delta.Error)
+                deltaState = stInit;
+            break;
+    }
+    
+    // Execute all commands given in this cycle
+    MpDelta3Axis(&delta);
+    
+    // magnet    
+    if(gActivateGripper == 1) pwm4_Grip = 32767;
+    else pwm4_Grip = 0;
+}
+ 
+ 
+void _EXIT ProgramExit(void)
+{
+    // Shutdown routine
+    // stop all movement
+    delta.Home = 0;
+    delta.MoveDirect = 0;
+    delta.MoveProgram = 0;
+    // switch power off
+    delta.Power = 0;
+    // execute commands
+    MpDelta3Axis(&delta);
+    
+    // disable system
+    delta.Enable = 0;
+    MpDelta3Axis(&delta);
+}
