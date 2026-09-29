@@ -1,4 +1,4 @@
-// Код управления логикой и движением робота для сортировки
+// The code for controlling the robot’s logic and movement for sorting.
 #include <bur/plctypes.h>
 #ifdef _DEFAULT_INCLUDES
 #include <AsDefault.h>
